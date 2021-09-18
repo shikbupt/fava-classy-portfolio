@@ -10,6 +10,7 @@ from beancount.core.data import iter_entry_dates, Open, Commodity
 from beancount.core.number import ZERO, D, Decimal
 from beancount.core import prices
 from beancount.core import convert
+from beancount.core.amount import Amount
 
 from flask import g
 
@@ -18,7 +19,7 @@ from fava.template_filters import cost_or_value
 from fava.core.tree import Tree
 from fava.helpers import FavaAPIException
 from fava.core.conversion import get_market_value
-from fava.application import app
+from fava.application import account, app
 
 
 class AccountsDict(dict):
@@ -44,6 +45,32 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
 
     report_title = "Classy Portfolio"
 
+    def get_operating_currency(self):
+        if g.conversion in self.ledger.options["operating_currency"]:
+            return g.conversion
+        return self.ledger.options["operating_currency"][0]
+
+    def add_operating_currency(self, number: dict):
+        existing_commodity = list(number.keys())[0]
+        operating_currency_cost = convert.convert_amount(
+            Amount(number[existing_commodity], existing_commodity),
+            self.operating_currency, g.ledger.price_map,
+            self.ledger._date_last, self.ledger.options["operating_currency"])
+        number[self.operating_currency] = operating_currency_cost.number
+        return number
+
+    def humanize_account_name(self, account_name):
+        for entry in self.ledger.all_entries_by_type.Open:
+            if account_name == entry.account:
+                return entry.meta.get('name', account_name)
+        return account_name
+
+    def format_account_name(self, humanize_account_name):
+        for entry in self.ledger.all_entries_by_type.Open:
+            if 'name' in entry.meta and entry.meta['name'] == humanize_account_name:
+                return entry.account
+        return humanize_account_name
+
     def load_report(self):
         # self.account_open_dict = {entry.account: entry for entry in
         # self.ledger.all_entries_by_type.Open}
@@ -53,25 +80,39 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
     def portfolio_accounts(self, begin=None, end=None):
         """An account tree based on matching regex patterns."""
         portfolios = []
+        self.dividend = {}
 
         try:
             self.load_report()
+            self.operating_currency = self.get_operating_currency()
 
             if begin:
                 tree = Tree(iter_entry_dates(self.ledger.entries, begin, end))
             else:
                 tree = self.ledger.root_tree
 
+            config = []
             for option in self.config:
+                if option[0] == 'dividend_account_name':
+                    config.insert(0, option)
+                    continue
+                config.append(option)
+
+            for option in config:
                 opt_key = option[0]
                 if opt_key == "account_name_pattern":
-                    portfolio = self._account_name_pattern(tree, end, option[1])
+                    portfolio = self._account_name_pattern(
+                        tree, end, option[1])
                 elif opt_key == "account_open_metadata_pattern":
                     portfolio = self._account_metadata_pattern(
                         tree, end, option[1][0], option[1][1]
                     )
+                elif opt_key == 'dividend_account_name':
+                    self._add_dividend(tree, end, option[1])
+                    continue
                 else:
-                    exception = FavaAPIException("Classy Portfolio: Invalid option.")
+                    exception = FavaAPIException(
+                        "Classy Portfolio: Invalid option.")
                     raise(exception)
 
                 portfolio = (portfolio[0],  # title
@@ -88,6 +129,29 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
             traceback.print_exc(file=sys.stdout)
 
         return portfolios
+
+    def _add_dividend(self, tree, date, pattern):
+        selected_accounts = []
+        regexer = re.compile(pattern)
+        for acct in tree.keys():
+            if (regexer.match(acct) is not None) and (
+                acct not in selected_accounts
+            ) and len(tree[acct].children) == 0:
+                selected_accounts.append(acct)
+        selected_nodes = [tree[x] for x in selected_accounts]
+
+        for node in selected_nodes:
+            account_name = self.humanize_account_name(node.name)
+            cost = node.balance.reduce(convert.get_cost)
+            if self.operating_currency in cost:
+                self.dividend[account_name] = cost[self.operating_currency]
+                continue
+            for currency in self.ledger.options["operating_currency"]:
+                if currency in cost:
+                    cost = self.add_operating_currency(
+                        {currency: cost[currency]})
+                    self.dividend[account_name] = cost[self.operating_currency]
+                    break
 
     def _account_name_pattern(self, tree, date, pattern):
         """
@@ -107,7 +171,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
         for acct in tree.keys():
             if (regexer.match(acct) is not None) and (
                 acct not in selected_accounts
-            ):
+            ) and len(tree[acct].children) == 0:
                 selected_accounts.append(acct)
 
         selected_nodes = [tree[x] for x in selected_accounts]
@@ -136,7 +200,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
         )
         selected_accounts = []
         regexer = re.compile(pattern)
-        for entry in self.ledger.all_entries_by_type.Open :
+        for entry in self.ledger.all_entries_by_type.Open:
             if (metadata_key in entry.meta) and (
                 regexer.match(entry.meta[metadata_key]) is not None
             ):
@@ -150,19 +214,25 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
         """
         Additional info on an asset (price, gain/loss)
         """
-        account_cost = (node.balance.reduce(convert.get_cost))[
-            self.operating_currency]
+        account_cost_node = (node.balance.reduce(convert.get_cost))
+        self.add_operating_currency(account_cost_node)
+        account_cost = account_cost_node[self.operating_currency]
+
         account_balance_market_value_node = node.balance.reduce(
-            get_market_value,
+            convert.convert_position,
+            self.operating_currency,
             g.ledger.price_map,
-            datetime.date.today())
+            self.ledger._date_last)
         account_balance_market_value = account_balance_market_value_node[
             self.operating_currency]
+
+        account_dividend = self.dividend.get(
+            self.humanize_account_name(node.name), ZERO)
 
         # Calculate unrealized gain/loss
         # (follow beancount convention that negative values are income)
         account_income_gain_loss_unrealized = \
-            account_cost - account_balance_market_value
+            account_cost - account_balance_market_value + account_dividend
 
         # Calculate unrealized gain/loss (percentage)
         account_gain_loss_unrealized_percentage = (
@@ -170,6 +240,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
             account_cost) * D(100.0)
 
         return account_balance_market_value, \
+            account_dividend, \
             account_income_gain_loss_unrealized, \
             account_gain_loss_unrealized_percentage
 
@@ -200,7 +271,6 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
             rows: Dictionaries of row data by column names.
         """
         errors = []
-        self.operating_currency = self.ledger.options["operating_currency"][0]
 
         types = [
             ("portfolio_total", str(Decimal)),
@@ -216,6 +286,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
             # ("class_allocation", str(Decimal)),
             ("asset_subclass_allocation", str(DecimalPercent)),
             ("balance_market_value", str(Decimal)),
+            ("income_cash_dividend", str(Decimal)),
             ("income_gain_loss", str(DecimalIncomeGainLoss)),
             ("gain_loss_percentage", str(DecimalPercentGainLoss)),
             ("latest_price_date", str(datetime.date))
@@ -225,7 +296,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
         portfolio_tree["portfolio_total"] = ZERO
         portfolio_tree["asset_classes"] = {}
         for node in nodes:
-            account_name = node.name
+            account_name = self.humanize_account_name(node.name)
             commodity = node_commodity(node)
             if (commodity in self.commodity_dict) and (
                "asset-class" in self.commodity_dict[commodity].meta
@@ -276,6 +347,9 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
             # Calculate cost
             account_cost_node = (node.balance.reduce(convert.get_cost))
 
+            if len(account_cost_node) > 0:
+                self.add_operating_currency(account_cost_node)
+
             if self.operating_currency in account_cost_node:
 
                 account_cost = account_cost_node[self.operating_currency]
@@ -288,9 +362,12 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
                     account_data["income_gain_loss"] = None
                     account_data["gain_loss_percentage"] = None
                     account_data["latest_price_date"] = None
+                    account_data["income_cash_dividend"] = self.dividend.get(
+                        account_name, ZERO)
                 else:
                     latest_price_date = latest_price[0]
                     account_balance_market_value, \
+                        account_dividend, \
                         account_income_gain_loss_unrealized, \
                         account_gain_loss_unrealized_percentage = \
                         self._asset_info(node)
@@ -299,6 +376,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
                     account_data["income_gain_loss"] = account_income_gain_loss_unrealized
                     account_data["gain_loss_percentage"] = account_gain_loss_unrealized_percentage
                     account_data["latest_price_date"] = latest_price_date
+                    account_data["income_cash_dividend"] = account_dividend
 
                 portfolio_tree["asset_classes"][asset_class][
                     "asset_subclasses"][asset_subclass][
@@ -319,6 +397,7 @@ class FavaClassyPortfolio(FavaExtensionBase):  # pragma: no cover
                 account_data["income_gain_loss"] = ZERO
                 account_data["gain_loss_percentage"] = ZERO
                 account_data["latest_price_date"] = None
+                account_data["income_cash_dividend"] = ZERO
                 portfolio_tree["asset_classes"][asset_class][
                     "asset_subclasses"][asset_subclass][
                     "accounts"][account_name] = account_data

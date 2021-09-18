@@ -35,7 +35,7 @@ td[data-string] {
 }
 
 td[data-account-string] {
-  max-width: 159px;
+  max-width: none;
   word-wrap: break-word;
   overflow-x: scroll;
   display: block;
@@ -93,7 +93,7 @@ span[data-portfolio-subtitle] {
 {% elif type == "account_name" %}
 {# NOTE: rowspan expected to be 1 for account names
          for proper layout #}
-<td data-account-string rowspan="{{rowspan}}"><a href="{{ url_for('account', name=value, time=time_filter) }}">{{ value }}</a></td>
+<td data-account-string rowspan="{{rowspan}}"><a href="{{ url_for('account', name=extension.format_account_name(value), time=time_filter) }}">{{ value }}</a></td>
 {% elif type == "<class 'decimal.Decimal'>" or type == "<class 'cdecimal.Decimal'>" %}
 <td class="num" data-sort-value="{{ value or 0 }}" rowspan="{{rowspan}}">{{ value|format_currency }}</td>
 {% elif type == "<class 'beancount.core.amount.Amount'>" %}
@@ -222,10 +222,28 @@ span[data-portfolio-subtitle] {
 {% endif %}
 {% endmacro %}
 
+<script>
+  function redirect(path){
+    const query = this.location.search;
+    const params = new URLSearchParams(query);
+    params.set('conversion', path)
+    this.location.assign('?'+params.toString())
+  }
+</script>
 
 <h2>Classy Portfolio</h2>
+<div align=right>
+<select onchange="redirect(this.value)">
+  {% for currency in ledger.options["operating_currency"] %}
+    <option value="{{currency}}" {% if g.conversion == currency %} selected {% endif %}>converted to {{ currency }}</option>
+  {% endfor %}
+</select>
 <br />
-{% for portfolio in extension.portfolio_accounts(None, None) %}
+<b>{{ ledger._date_first }} ~ {{ledger._date_last }}</b>
+</div>
+<br />
+
+{% for portfolio in extension.portfolio_accounts(ledger._date_first, ledger._date_last) %}
     <h3 data-portfolio-title>{{portfolio[0]}}</h3>
     <span data-portfolio-subtitle>{{portfolio[1]}}</span>
     {{ portfoliotable(*portfolio[2]) }}
