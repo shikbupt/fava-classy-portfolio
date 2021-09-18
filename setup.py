@@ -11,7 +11,7 @@ setup(
     description='Fava Extension for viewing your financial portfolio kept in a Beancount plaintext accounting ledger.',
     long_description=LONG_DESCRIPTION,
     long_description_content_type='text/markdown',
-    url='https://github.com/shikbupt/fava-classy-portfolio',
+    url='https://github.com/shikbupt/fava_classy_portfolio.git',
     author='sk',
     author_email='shikbupt@gmail.com',
     license='GPL-3.0',
